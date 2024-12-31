@@ -2,3 +2,4 @@
 
 This is a fork of the original code to do it for Mailslot, but instead my attempt at doing it with named pipes
 
+Make sure you have Seatbelt installed
