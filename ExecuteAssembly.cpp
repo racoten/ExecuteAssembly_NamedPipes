@@ -7,384 +7,272 @@
 #include <string>
 #include <iostream>
 
-
-//Make sure to add $(NETFXKitsDir)Include\um to your include directories
-#import "mscorlib.tlb" raw_interfaces_only, auto_rename				\
-    high_property_prefixes("_get","_put","_putref")		\
+// Include necessary directories for .NET
+#import "mscorlib.tlb" raw_interfaces_only, auto_rename \
+    high_property_prefixes("_get","_put","_putref") \
     rename("ReportEvent", "InteropServices_ReportEvent")
 #pragma comment(lib, "mscoree.lib")
 using namespace mscorlib;
 
 ICorRuntimeHost* g_Runtime = NULL;
+HANDLE g_OriginalStdOut = INVALID_HANDLE_VALUE;
+HANDLE g_OriginalStdErr = INVALID_HANDLE_VALUE;
+HANDLE g_hNamedPipe = INVALID_HANDLE_VALUE;
+LPCSTR PipeName = "\\\\.\\pipe\\myNamedPipe";
 
-HANDLE g_OrigninalStdOut = INVALID_HANDLE_VALUE;
-HANDLE g_CurrentStdOut = INVALID_HANDLE_VALUE;
-HANDLE g_OrigninalStdErr = INVALID_HANDLE_VALUE;
-HANDLE g_CurrentStdErr = INVALID_HANDLE_VALUE;
+// Create a named pipe server
+BOOL CreateNamedPipeServer() {
+    g_hNamedPipe = CreateNamedPipeA(
+        PipeName,
+        PIPE_ACCESS_DUPLEX,
+        PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
+        PIPE_UNLIMITED_INSTANCES,
+        512,
+        512,
+        0,
+        NULL
+    );
 
+    if (g_hNamedPipe == INVALID_HANDLE_VALUE) {
+        printf("CreateNamedPipe failed with %d\n", GetLastError());
+        return FALSE;
+    }
 
-HANDLE g_hSlot = INVALID_HANDLE_VALUE;
-LPCSTR SlotName = "\\\\.\\mailslot\\myMailSlot";
-
-//Taken from : https://docs.microsoft.com/en-us/windows/win32/ipc/writing-to-a-mailslot
-BOOL WINAPI MakeSlot(LPCSTR lpszSlotName)
-{
-	g_hSlot = CreateMailslotA(lpszSlotName,
-		0,                             // no maximum message size 
-		MAILSLOT_WAIT_FOREVER,         // no time-out for operations 
-		(LPSECURITY_ATTRIBUTES)NULL); // default security
-
-	if (g_hSlot == INVALID_HANDLE_VALUE)
-	{
-		printf("CreateMailslot failed with %d\n", GetLastError());
-		return FALSE;
-	}
-	else printf("Mailslot created successfully.\n");
-	return TRUE;
+    printf("Named pipe created successfully.\n");
+    return TRUE;
 }
 
-// Mostly from : https://docs.microsoft.com/en-us/windows/win32/ipc/reading-from-a-mailslot
-BOOL ReadSlot(std::string& output)
-{
-	CONST DWORD szMailBuffer = 424; //Size comes from https://docs.microsoft.com/en-us/windows/win32/ipc/about-mailslots?redirectedfrom=MSDN
-	DWORD cbMessage, cMessage, cbRead;
-	BOOL fResult;
-	LPSTR lpszBuffer = NULL;
-	LPVOID achID[szMailBuffer];
-	DWORD cAllMessages;
-	HANDLE hEvent;
-	OVERLAPPED ov;
+// Read output from the named pipe
+BOOL ReadFromPipe(std::string& output) {
+    CHAR buffer[512];
+    DWORD bytesRead = 0;
 
-	cbMessage = cMessage = cbRead = 0;
+    if (!ConnectNamedPipe(g_hNamedPipe, NULL) && GetLastError() != ERROR_PIPE_CONNECTED) {
+        printf("ConnectNamedPipe failed with %d\n", GetLastError());
+        return FALSE;
+    }
 
-	hEvent = CreateEventA(NULL, FALSE, FALSE, NULL);
-	if (NULL == hEvent)
-		return FALSE;
-	ov.Offset = 0;
-	ov.OffsetHigh = 0;
-	ov.hEvent = hEvent;
+    printf("Client connected. Reading from pipe...\n");
 
-	fResult = GetMailslotInfo(g_hSlot, // mailslot handle 
-		(LPDWORD)NULL,               // no maximum message size 
-		&cbMessage,                   // size of next message 
-		&cMessage,                    // number of messages 
-		(LPDWORD)NULL);              // no read time-out 
+    while (ReadFile(g_hNamedPipe, buffer, sizeof(buffer) - 1, &bytesRead, NULL)) {
+        buffer[bytesRead] = '\0'; // Null-terminate the string
+        output += buffer;
+        if (bytesRead < sizeof(buffer) - 1)
+            break; // Exit loop if all data has been read
+    }
 
-	if (!fResult)
-	{
-		printf("GetMailslotInfo failed with %d.\n", GetLastError());
-		return FALSE;
-	}
+    if (GetLastError() != ERROR_BROKEN_PIPE) {
+        printf("ReadFile failed with %d\n", GetLastError());
+    }
 
-	if (cbMessage == MAILSLOT_NO_MESSAGE)
-	{
-		printf("Waiting for a message...\n");
-		return TRUE;
-	}
-
-	cAllMessages = cMessage;
-
-	while (cMessage != 0)  // retrieve all messages
-	{
-		// Allocate memory for the message. 
-
-		lpszBuffer = (LPSTR)GlobalAlloc(GPTR, lstrlenA((LPSTR)achID) * sizeof(CHAR) + cbMessage);
-		if (NULL == lpszBuffer)
-			return FALSE;
-		lpszBuffer[0] = '\0';
-
-		fResult = ReadFile(g_hSlot,
-			lpszBuffer,
-			cbMessage,
-			&cbRead,
-			&ov);
-
-		if (!fResult)
-		{
-			printf("ReadFile failed with %d.\n", GetLastError());
-			GlobalFree((HGLOBAL)lpszBuffer);
-			return FALSE;
-		}
-		output += lpszBuffer;
-
-		fResult = GetMailslotInfo(g_hSlot,  // mailslot handle 
-			(LPDWORD)NULL,               // no maximum message size 
-			&cbMessage,                   // size of next message 
-			&cMessage,                    // number of messages 
-			(LPDWORD)NULL);              // no read time-out 
-
-		if (!fResult)
-		{
-			printf("GetMailslotInfo failed (%d)\n", GetLastError());
-			return FALSE;
-		}
-	}
-	GlobalFree((HGLOBAL)lpszBuffer);
-	CloseHandle(hEvent);
-	return TRUE;
+    DisconnectNamedPipe(g_hNamedPipe);
+    return TRUE;
 }
 
+HRESULT LoadCLR() {
+    HRESULT hr;
+    ICLRMetaHost* pMetaHost = NULL;
+    ICLRRuntimeInfo* pRuntimeInfo = NULL;
+    BOOL bLoadable;
 
-HRESULT LoadCLR()
-{
-	HRESULT hr;
-	ICLRMetaHost* pMetaHost = NULL;
-	ICLRRuntimeInfo* pRuntimeInfo = NULL;
-	BOOL bLoadable;
+    hr = CLRCreateInstance(CLSID_CLRMetaHost, IID_ICLRMetaHost, (LPVOID*)&pMetaHost);
+    if (FAILED(hr)) {
+        printf("Failed to create CLR instance. HRESULT: 0x%lx\n", hr);
+        return hr;
+    }
 
-	// Open the runtime
-	hr = CLRCreateInstance(CLSID_CLRMetaHost, IID_ICLRMetaHost, (LPVOID*)&pMetaHost);
-	if (FAILED(hr))
-		goto Cleanup;
+    hr = pMetaHost->GetRuntime(L"v4.0.30319", IID_ICLRRuntimeInfo, (LPVOID*)&pRuntimeInfo);
+    if (FAILED(hr)) {
+        printf("Failed to get CLR runtime. HRESULT: 0x%lx\n", hr);
+        pMetaHost->Release();
+        return hr;
+    }
 
-	//DotNet version v4.0.30319
-	hr = pMetaHost->GetRuntime(L"v4.0.30319", IID_ICLRRuntimeInfo, (LPVOID*)&pRuntimeInfo);
-	if (FAILED(hr))
-		goto Cleanup;
+    hr = pRuntimeInfo->IsLoadable(&bLoadable);
+    if (FAILED(hr) || !bLoadable) {
+        printf("CLR runtime is not loadable. HRESULT: 0x%lx\n", hr);
+        pRuntimeInfo->Release();
+        pMetaHost->Release();
+        return hr;
+    }
 
-	// Check if the runtime is loadable (this will fail without .Net v4.x on the system)
+    hr = pRuntimeInfo->GetInterface(CLSID_CorRuntimeHost, IID_ICorRuntimeHost, (LPVOID*)&g_Runtime);
+    if (FAILED(hr)) {
+        printf("Failed to get CLR runtime host. HRESULT: 0x%lx\n", hr);
+        pRuntimeInfo->Release();
+        pMetaHost->Release();
+        return hr;
+    }
 
-	hr = pRuntimeInfo->IsLoadable(&bLoadable);
-	if (FAILED(hr) || !bLoadable)
-		goto Cleanup;
+    hr = g_Runtime->Start();
+    if (FAILED(hr)) {
+        printf("Failed to start CLR. HRESULT: 0x%lx\n", hr);
+        g_Runtime->Release();
+        pRuntimeInfo->Release();
+        pMetaHost->Release();
+        return hr;
+    }
 
-	// Load the CLR into the current process
-	hr = pRuntimeInfo->GetInterface(CLSID_CorRuntimeHost, IID_ICorRuntimeHost, (LPVOID*)&g_Runtime);
-	if (FAILED(hr))
-		goto Cleanup;
+    printf("CLR v4.0.30319 loaded successfully.\n");
 
-	// Start the CLR.
-	hr = g_Runtime->Start();
-	if (FAILED(hr))
-		goto Cleanup;
-
-Cleanup:
-
-	if (pMetaHost)
-	{
-		pMetaHost->Release();
-		pMetaHost = NULL;
-	}
-	if (pRuntimeInfo)
-	{
-		pRuntimeInfo->Release();
-		pRuntimeInfo = NULL;
-	}
-	if (FAILED(hr) && g_Runtime)
-	{
-		g_Runtime->Release();
-		g_Runtime = NULL;
-	}
-
-	return hr;
+    pRuntimeInfo->Release();
+    pMetaHost->Release();
+    return S_OK;
 }
-
 
 HRESULT CallMethod(std::string assembly, std::string args, std::string& outputString) {
-	HRESULT hr = S_OK;
-	SAFEARRAY* psaArguments = NULL;
-	IUnknownPtr pUnk = NULL;
-	_AppDomainPtr pAppDomain = NULL;
-	_AssemblyPtr pAssembly = NULL;
-	_MethodInfo* pEntryPt = NULL;
-	SAFEARRAYBOUND bounds[1];
-	SAFEARRAY* psaBytes = NULL;
-	LONG rgIndices = 0;
-	wchar_t* w_ByteStr = NULL;
-	LPWSTR* szArglist = NULL;
-	int nArgs = 0;
-	VARIANT vReturnVal;
-	VARIANT vEmpty;
-	VARIANT vtPsa;
+    HRESULT hr = S_OK;
+    SAFEARRAY* psaArguments = NULL;
+    IUnknownPtr pUnk = NULL;
+    _AppDomainPtr pAppDomain = NULL;
+    _AssemblyPtr pAssembly = NULL;
+    _MethodInfo* pEntryPt = NULL;
+    SAFEARRAYBOUND bounds[1];
+    SAFEARRAY* psaBytes = NULL;
+    LONG rgIndices = 0;
+    wchar_t* w_ByteStr = NULL;
+    LPWSTR* szArglist = NULL;
+    int nArgs = 0;
+    VARIANT vReturnVal;
+    VARIANT vEmpty;
+    VARIANT vtPsa;
 
-	SecureZeroMemory(&vReturnVal, sizeof(VARIANT));
-	SecureZeroMemory(&vEmpty, sizeof(VARIANT));
-	SecureZeroMemory(&vtPsa, sizeof(VARIANT));
-	vEmpty.vt = VT_NULL;
-	vtPsa.vt = (VT_ARRAY | VT_BSTR);
+    SecureZeroMemory(&vReturnVal, sizeof(VARIANT));
+    SecureZeroMemory(&vEmpty, sizeof(VARIANT));
+    SecureZeroMemory(&vtPsa, sizeof(VARIANT));
+    vEmpty.vt = VT_NULL;
+    vtPsa.vt = (VT_ARRAY | VT_BSTR);
 
-	//Get a pointer to the IUnknown interface because....COM
-	hr = g_Runtime->GetDefaultDomain(&pUnk);
-	if (FAILED(hr))
-		goto Cleanup;
+    printf("Loading the default app domain...\n");
+    hr = g_Runtime->GetDefaultDomain(&pUnk);
+    if (FAILED(hr)) {
+        printf("Failed to get default app domain. HRESULT: 0x%lx\n", hr);
+        return hr;
+    }
 
+    hr = pUnk->QueryInterface(IID_PPV_ARGS(&pAppDomain));
+    if (FAILED(hr)) {
+        printf("Failed to get app domain. HRESULT: 0x%lx\n", hr);
+        return hr;
+    }
 
-	// Get the current app domain
-	hr = pUnk->QueryInterface(IID_PPV_ARGS(&pAppDomain));
-	if (FAILED(hr))
-		goto Cleanup;
+    bounds[0].cElements = (ULONG)assembly.size();
+    bounds[0].lLbound = 0;
 
-	// Load the assembly
-	//Establish the bounds for our safe array
-	bounds[0].cElements = (ULONG)assembly.size();
-	bounds[0].lLbound = 0;
+    psaBytes = SafeArrayCreate(VT_UI1, 1, bounds);
+    SafeArrayLock(psaBytes);
+    memcpy(psaBytes->pvData, assembly.data(), assembly.size());
+    SafeArrayUnlock(psaBytes);
 
-	//Create a safe array and fill it with the bytes of our .net assembly
-	psaBytes = SafeArrayCreate(VT_UI1, 1, bounds);
-	SafeArrayLock(psaBytes);
-	memcpy(psaBytes->pvData, assembly.data(), assembly.size());
-	SafeArrayUnlock(psaBytes);
+    printf("Loading the assembly into the app domain...\n");
+    hr = pAppDomain->Load_3(psaBytes, &pAssembly);
+    SafeArrayDestroy(psaBytes);
+    if (FAILED(hr)) {
+        printf("Failed to load assembly. HRESULT: 0x%lx\n", hr);
+        return hr;
+    }
 
-	//Load the assembly into the app domain
-	hr = pAppDomain->Load_3(psaBytes, &pAssembly);
-	if (FAILED(hr))
-	{
+    printf("Retrieving entry point of the assembly...\n");
+    hr = pAssembly->get_EntryPoint(&pEntryPt);
+    if (FAILED(hr)) {
+        printf("Failed to get entry point. HRESULT: 0x%lx\n", hr);
+        return hr;
+    }
 
-		SafeArrayDestroy(psaBytes);
-		goto Cleanup;
-	}
+    if (args.empty()) {
+        vtPsa.parray = SafeArrayCreateVector(VT_BSTR, 0, 0);
+    }
+    else {
+        w_ByteStr = (wchar_t*)malloc((sizeof(wchar_t) * args.size() + 1));
+        mbstowcs(w_ByteStr, args.c_str(), args.size() + 1);
+        szArglist = CommandLineToArgvW(w_ByteStr, &nArgs);
 
-	SafeArrayDestroy(psaBytes);
+        vtPsa.parray = SafeArrayCreateVector(VT_BSTR, 0, nArgs);
+        for (long i = 0; i < nArgs; i++) {
+            BSTR strParam = SysAllocString(szArglist[i]);
+            SafeArrayPutElement(vtPsa.parray, &i, strParam);
+        }
+    }
 
-	// Find the entry point
-	hr = pAssembly->get_EntryPoint(&pEntryPt);
+    psaArguments = SafeArrayCreateVector(VT_VARIANT, 0, 1);
+    hr = SafeArrayPutElement(psaArguments, &rgIndices, &vtPsa);
 
-	if (FAILED(hr))
-		goto Cleanup;
+    printf("Invoking the assembly entry point...\n");
+    hr = pEntryPt->Invoke_3(vEmpty, psaArguments, &vReturnVal);
 
-	//This will take our arguments and format them so they look like command line arguments to main (otherwise they are treated as a single string)
-	//Credit to https://github.com/b4rtik/metasploit-execute-assembly/blob/master/HostingCLR_inject/HostingCLR/HostingCLR.cpp for getting this to work properly
-	if (args.empty())
-	{
+    if (FAILED(hr)) {
+        printf("Failed to invoke entry point. HRESULT: 0x%lx\n", hr);
+    }
 
-		vtPsa.parray = SafeArrayCreateVector(VT_BSTR, 0, 0);
+    VariantClear(&vReturnVal);
+    if (psaArguments)
+        SafeArrayDestroy(psaArguments);
+    if (pAssembly)
+        pAssembly->Release();
 
-	}
-	else
-	{
-		//Convert to wide characters
-		w_ByteStr = (wchar_t*)malloc((sizeof(wchar_t) * args.size() + 1));
-		mbstowcs(w_ByteStr, (char*)args.data(), args.size() + 1);
-		szArglist = CommandLineToArgvW(w_ByteStr, &nArgs);
-
-
-		vtPsa.parray = SafeArrayCreateVector(VT_BSTR, 0, nArgs);
-		for (long i = 0; i < nArgs; i++)
-		{
-			BSTR strParam1 = SysAllocString(szArglist[i]);
-			SafeArrayPutElement(vtPsa.parray, &i, strParam1);
-		}
-	}
-
-	psaArguments = SafeArrayCreateVector(VT_VARIANT, 0, 1);
-
-	hr = SafeArrayPutElement(psaArguments, &rgIndices, &vtPsa);
-
-	//Execute the function.  Note that if you are executing a function with return data it will end up in vReturnVal
-	hr = pEntryPt->Invoke_3(vEmpty, psaArguments, &vReturnVal);
-
-	//Reset our Output handles (the error message won't show up if they fail, just for debugging purposes)
-	if (!SetStdHandle(STD_OUTPUT_HANDLE, g_OrigninalStdOut))
-	{
-		std::cerr << "ERROR: SetStdHandle REVERTING stdout failed." << std::endl;
-	}
-	if (!SetStdHandle(STD_ERROR_HANDLE, g_OrigninalStdErr))
-	{
-		std::cerr << "ERROR: SetStdHandle REVERTING stderr failed." << std::endl;
-	}
-
-	//Read from our mail slot
-	if (!ReadSlot(outputString))
-		printf("Failed to read from mail slot");
-
-Cleanup:
-	VariantClear(&vReturnVal);
-	if (NULL != psaArguments)
-		SafeArrayDestroy(psaArguments);
-	psaArguments = NULL;
-	pAssembly->Release();
-
-	return hr;
+    return hr;
 }
 
+std::string ExecuteAssembly(std::string& assembly, std::string args) {
+    HRESULT hr;
+    std::string output;
 
-std::string ExecuteAssembly(std::string& assembly, std::string args)
-{
-	HRESULT hr;
-	std::string output = "";
+    if (!CreateNamedPipeServer()) {
+        printf("Failed to create named pipe\n");
+        return "Pipe creation failed";
+    }
 
-	//Create our mail slot
-	if (!MakeSlot(SlotName))
-	{
-		printf("Failed to create mail slot");
-		return output;
-	}
-	HANDLE hFile = CreateFileA(SlotName, GENERIC_WRITE, FILE_SHARE_READ, (LPSECURITY_ATTRIBUTES)NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, (HANDLE)NULL);
+    hr = LoadCLR();
+    if (FAILED(hr)) {
+        printf("Failed to load CLR: HRESULT 0x%lx\n", hr);
+        return "CLR Load Failure";
+    }
 
-	//Load the CLR
-	hr = LoadCLR();
-	if (FAILED(hr))
-	{
-		output = "failed to load CLR";
-		goto END;
-	}
-	printf("Successfully loaded CLR\n");
-	//Set stdout and stderr to our mail slot
-	g_OrigninalStdOut = GetStdHandle(STD_OUTPUT_HANDLE);
-	g_OrigninalStdErr = GetStdHandle(STD_ERROR_HANDLE);
+    printf("Successfully loaded CLR.\n");
 
+    std::string methodOutput;
+    hr = CallMethod(assembly, args, methodOutput);
+    if (FAILED(hr)) {
+        printf("Failed to execute method: HRESULT 0x%lx\n", hr);
+        return "Method Execution Failed";
+    }
 
-	if (!SetStdHandle(STD_OUTPUT_HANDLE, hFile))
-	{
-		output = "SetStdHandle stdout failed.";
-		goto END;
-	}
-	if (!SetStdHandle(STD_ERROR_HANDLE, hFile))
-	{
-		output = "SetStdHandle stderr failed.";
-		goto END;
-	}
+    if (!ReadFromPipe(output)) {
+        printf("Failed to read output from named pipe.\n");
+    }
 
-
-	hr = CallMethod(assembly, args, output);
-	if (FAILED(hr))
-		output = "failed to call method";
-
-END:
-	if (g_hSlot != INVALID_HANDLE_VALUE)
-		CloseHandle(g_hSlot);
-	if (hFile != INVALID_HANDLE_VALUE)
-		CloseHandle(hFile);
-	return output;
+    CloseHandle(g_hNamedPipe);
+    return output;
 }
 
+int main() {
+    DWORD lpNumberOfBytesRead = 0;
+    DWORD dwFileSize = 0;
+    PVOID lpFileBuffer = NULL;
+    std::string args = "";
 
-int main()
-{
-	DWORD lpNumberOfBytesRead = 0;
-	DWORD dwFileSize = 0;
-	PVOID lpFileBuffer = NULL;
+    HANDLE hFile = CreateFileA("Z:\\Hacking\\Seatbelt\\Seatbelt\\bin\\Release\\Seatbelt.exe", GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
 
-	//arguments seperated by a space : "kerberoast /tgtdeleg" or just ""
-	std::string args = "";
+    if (hFile == INVALID_HANDLE_VALUE) {
+        printf("Failed to open file. Error: %d\n", GetLastError());
+        return 1;
+    }
 
-	//Read the .net exe from disk
-	HANDLE hFile = CreateFileA("C:\\Users\\admin\\Desktop\\Seatbelt.exe", GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+    dwFileSize = GetFileSize(hFile, NULL);
+    lpFileBuffer = VirtualAlloc(NULL, dwFileSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
 
-	if (hFile == INVALID_HANDLE_VALUE)
-	{
-		return 1;
-	}
+    if (!ReadFile(hFile, lpFileBuffer, dwFileSize, &lpNumberOfBytesRead, NULL)) {
+        printf("Failed to read file. Error: %d\n", GetLastError());
+        CloseHandle(hFile);
+        return 1;
+    }
 
+    std::string assemblyStr((char*)lpFileBuffer, lpNumberOfBytesRead);
+    std::string response = ExecuteAssembly(assemblyStr, args);
 
-	dwFileSize = GetFileSize(hFile, NULL);
-	lpFileBuffer = VirtualAlloc(NULL, dwFileSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    VirtualFree(lpFileBuffer, dwFileSize, MEM_DECOMMIT | MEM_RELEASE);
+    CloseHandle(hFile);
 
-	if (!ReadFile(hFile, lpFileBuffer, dwFileSize, &lpNumberOfBytesRead, NULL))
-	{
-		return 1;
-	}
-
-	//No real reason to do this, it just works with the code I had already written
-	std::string assemblyStr((char*)lpFileBuffer, lpNumberOfBytesRead);
-
-	//Execute the Assembly
-	std::string response = ExecuteAssembly(assemblyStr, args);
-
-	VirtualFree(lpFileBuffer, dwFileSize, MEM_DECOMMIT | MEM_RELEASE);
-	CloseHandle(hFile);
-
-	printf("Output from string = %s", response.c_str());
-
+    printf("Output from assembly: %s\n", response.c_str());
+    return 0;
 }
-
