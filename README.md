@@ -1,4 +1,4 @@
-# In Process execute assembly and read using mailslots
+# In Process execute assembly and read using NamedPipes
 
-This is a PoC for my blog post : https://teamhydra.blog/2020/10/12/in-process-execute-assembly-and-mail-slots/
+This is a fork of the original code to do it for Mailslot, but instead my attempt at doing it with named pipes
 
